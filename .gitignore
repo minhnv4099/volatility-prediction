@@ -1,2 +1,9 @@
+# Files
+.DS_Store
+*.xml
+
+# Folders
 /.venv/
-/.idea/
+.idea/
+/env/
+__pycache__/
