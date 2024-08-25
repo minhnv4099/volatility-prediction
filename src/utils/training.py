@@ -90,11 +90,7 @@ class Trainer:
                 last_loss = running_loss / 1000  # loss per batch
                 print(' batch {} loss: {}'.format(i + 1, last_loss))
                 tb_x = epoch_index * len(self.train_loader) + i + 1
-                tb_writer.add_scalar(
-                    main_tag='Loss/train',
-                    tag_scalar_dict=last_loss,
-                    global_step=tb_x
-                )
+                tb_writer.add_scalar('Loss/train', last_loss, tb_x)
                 running_loss = 0.
 
         return last_loss
