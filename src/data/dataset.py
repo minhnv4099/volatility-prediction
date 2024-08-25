@@ -1,6 +1,7 @@
-import copy
 import glob
 import os
+
+import numpy as np
 import pandas as pd
 import torch
 import talib
@@ -33,11 +34,11 @@ class StocksDatasetConfig:
     )
 
     post_fields: Optional[List[str]] = field(
-        default_factory=lambda: ['open', 'low', 'high', 'EMA', 'SMA',  'volume', 'close'],
+        default_factory=lambda: ['open', 'low', 'high', 'EMA', 'SMA',  'volume'],
         metadata="Needing field take to train model."
     )
 
-    standard_cols: Optional[List[str]] = field(
+    normal_cols: Optional[List[str]] = field(
         default_factory=lambda: ['open', 'high', 'low', 'EMA', 'SMA']
     )
 
@@ -46,7 +47,7 @@ class StocksDatasetConfig:
     )
 
     target_field: Optional[str] = field(
-        default='close',
+        default_factory=lambda: ['close'],
         metadata='Field used to as target.'
     )
 
@@ -105,6 +106,10 @@ class StockDataset(Dataset):
     def __len__(self):
         return len(self.sample_df)
 
+    def __getitem__(self, idx: int):
+        sample = self.sample_df.loc[idx, :].values
+        return torch.tensor(sample[0]).to(self.config.dtype), torch.tensor(sample[1]).to(self.config.dtype)
+
     def load_data_csv(
             self,
             csv_path: str,
@@ -124,17 +129,16 @@ class StockDataset(Dataset):
     def load_ensemble_data_csv(self):
         csv_paths = glob.glob(f"{self.config.dataset_dir}/*.csv")
         dfs = [self.load_data_csv(csv_path) for csv_path in csv_paths]
-        return pd.concat(dfs, axis=0, ignore_index=False, )
+        return pd.concat(dfs, axis=0, ignore_index=True,)
 
     def pre_process(self):
-        tmp_df = copy.copy(self.df)
-
         # Rename columns to lower case
-        tmp_df.columns = tmp_df.columns.map(mapper=str.lower)
+        self.df.columns = self.df.columns.map(mapper=str.lower)
 
-        # Convert to timestamp
-        tmp_df['date_time'] = pd.to_datetime(tmp_df['date/time'])
-        tmp_df['timestamp'] = tmp_df['date_time'].apply(lambda x: x.timestamp())
+        # Date form YYYY/MM/DD HH:mm:SS
+        self.df['date_time'] = pd.to_datetime(self.df['date/time'])
+        # Timestamp in second
+        self.df['timestamp'] = self.df['date_time'].apply(lambda x: x.timestamp())
 
         if self.config.unit == 'min':
             duration = 60
@@ -149,10 +153,35 @@ class StockDataset(Dataset):
             duration = 1
             unit = 's'
 
-        tmp_df[f'timestamp_{self.config.unit}'] = (tmp_df['timestamp'] // duration).convert_dtypes('int')
-        tmp_df['date/time'] = tmp_df[f'timestamp_{self.config.unit}'].apply(lambda x: pd.to_datetime(x, unit=unit))
+        # Timestamp form unit
+        self.df[f'timestamp_{self.config.unit}'] = (self.df['timestamp'] // duration).convert_dtypes('int')
+        # Date form unit
+        self.df['date/time'] = self.df[f'timestamp_{self.config.unit}'].apply(lambda x: pd.to_datetime(x, unit=unit))
 
-        self.df = tmp_df
+        ticker_dfs = []
+        for ticker in self.df['ticker'].unique():
+            index = self.df['ticker'] == ticker
+            ticker_df: pd.DataFrame = self.df.loc[index, :]
+            ticker_df = ticker_df.sort_values(
+                by=[f"timestamp_{self.config.unit}", "timestamp"],
+                ascending=True, ignore_index=True, inplace=False
+            )
+
+            ticker_df['unit_return'] = ticker_df['close'].pct_change(periods=1)
+
+            if self.config.averaging_fields:
+                self._add_averaging_index(df=ticker_df)
+                ticker_df.fillna(value=0, inplace=True)
+
+            self.normalizer.fit(
+                df=ticker_df,
+                ticker=ticker,
+            )
+            ticker_dfs.append(ticker_df)
+
+        self.df = pd.concat(ticker_dfs, ignore_index=True, axis=0)
+        self.df.index = self.df.loc[:, 'date_time']
+        self.df.drop(columns=['date_time'], inplace=True, axis=1)
 
     def split(
             self,
@@ -162,63 +191,37 @@ class StockDataset(Dataset):
         if not self.config.data_raw:
             raise ValueError('Data is already sub-set, no need split.')
 
-        if not self.config.separate_ticker:
-            train_df, val_df, test_df = self._split_df(
-                df=self.df,
+        train_dfs, val_dfs, test_dfs, sample_dfs = [], [], [], []
+        for ticker in self.df['ticker'].unique():
+            index = self.df['ticker'] == ticker
+            ticker_df: pd.DataFrame = self.df.loc[index, :]
+
+            ticker_df = self.normalizer(
+                df=ticker_df,
+                ticker=ticker
+            )
+
+            if self.config.data_raw:
+                ticker_df = self._generate_timeseries(df=ticker_df)
+            sample_dfs.append(ticker_df)
+
+            ticker_train_df, ticker_val_df, ticker_test_df = self._split_df(
+                ticker_df,
                 train_ratio=train_ratio,
                 val_ratio=val_ratio
             )
-        else:
-            tickers: List[str] = self.df['ticker'].unique()
-            train_dfs, val_dfs, test_dfs, ticker_dfs, sample_dfs = [], [], [], [], []
-            for ticker in tickers:
-                index = self.df['ticker'] == ticker
-                ticker_df: pd.DataFrame = self.df.loc[index, :]
-                ticker_df = ticker_df.sort_values(
-                    by=[f"timestamp_{self.config.unit}", "timestamp"],
-                    ascending=True, ignore_index=True, inplace=False
-                )
-                # ticker_df = ticker_df.groupby(
-                #     by=[f"timestamp_{self.config.unit}"],
-                #     group_keys=True, sort=True).apply(
-                #     func=lambda x: x.sort_values(by=['timestamp'], ascending=True, key=lambda t: t, ignore_index=True, inplace=False,).iloc[[0], :])
+            train_dfs.append(ticker_train_df)
+            val_dfs.append(ticker_val_df)
+            test_dfs.append(ticker_test_df)
 
-                if self.config.averaging_fields:
-                    self._add_averaging_index(df=ticker_df)
-                    ticker_df.fillna(value=0, inplace=True)
-                ticker_df = ticker_df.reindex(fill_value=0, columns=self.config.post_fields, method=None)
-                ticker_dfs.append(ticker_df)
+        if self.config.full_dataset:
+            self.sample_df = pd.concat(sample_dfs, ignore_index=True, axis=0)
 
-                ticker_train_df, ticker_val_df, ticker_test_df = self._split_df(
-                    ticker_df,
-                    train_ratio=train_ratio, val_ratio=val_ratio
-                )
-                self.normalizer.fit(
-                    df=ticker_train_df,
-                    ticker=ticker,
-                )
-                ticker_df = self.normalizer(df=ticker_df, ticker=ticker)
+        train_df = pd.concat(train_dfs, axis=0, ignore_index=True)
+        val_df = pd.concat(val_dfs, axis=0, ignore_index=True)
+        test_df = pd.concat(test_dfs, axis=0, ignore_index=True)
 
-                if self.config.data_raw:
-                    ticker_df = self._generate_timeseries(df=ticker_df)
-                sample_dfs.append(ticker_df)
-                ticker_train_df, ticker_val_df, ticker_test_df = self._split_df(
-                    ticker_df,
-                    train_ratio=train_ratio, val_ratio=val_ratio
-                )
-                train_dfs.append(ticker_train_df)
-                val_dfs.append(ticker_val_df)
-                test_dfs.append(ticker_test_df)
-
-            if self.config.full_dataset:
-                self.sample_df = pd.concat(sample_dfs, ignore_index=True, axis=0)
-            if self.config.data_raw:
-                self.df = pd.concat(ticker_dfs, ignore_index=True, axis=0)
-
-            train_df = pd.concat(train_dfs, axis=0, ignore_index=True)
-            val_df = pd.concat(val_dfs, axis=0, ignore_index=True)
-            test_df = pd.concat(test_dfs, axis=0, ignore_index=True)
-
+        self.config.data_raw = False
         sub_dataset_config = StocksDatasetConfig(
             load_ensemble=False,
             data_raw=False,
@@ -237,9 +240,9 @@ class StockDataset(Dataset):
         fields = set(df.columns).intersection(set(self.config.post_fields))
         assert fields
         fields = list(fields)
-        fields.remove('close')
         values = df.loc[:, fields].values
-        targets = df.loc[:, [self.config.target_field]].values
+        values = np.pad(array=values, pad_width=((self.config.timeperiod-1, 0), (0, 0)), constant_values='0')
+        targets = df.loc[:, self.config.target_field].values
         windows = []
         for i in range(0, len(values) - self.config.timeperiod,1):
             window = values[i:i+self.config.timeperiod, ...]
@@ -255,6 +258,7 @@ class StockDataset(Dataset):
             train_ratio: float = 0.0,
             val_ratio: float = 0.0
     ) -> Iterable[pd.DataFrame]:
+        df = df.sample(frac=1).reset_index(drop=True)
         train_length: int = int(train_ratio * len(df))
         val_length: int = int(val_ratio * len(df))
         test_length: int = len(df) - train_length - val_length
